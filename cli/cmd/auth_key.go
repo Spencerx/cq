@@ -5,8 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"regexp"
-	"strconv"
 	"strings"
 	"time"
 
@@ -14,21 +12,8 @@ import (
 
 	"github.com/mozilla-ai/cq/cli/internal/auth"
 	"github.com/mozilla-ai/cq/cli/internal/credstore"
+	"github.com/mozilla-ai/cq/sdk/go/ttl"
 )
-
-// maxAPIKeyTTL caps the lifetime parseTTL will accept. Matches the
-// platform's upper bound; kept here so the CLI can fail fast without
-// a round-trip and the help text and validator agree.
-const maxAPIKeyTTL = 365 * 24 * time.Hour // pragma: allowlist secret
-
-// ttlPattern is the canonical (lower-case) form of the platform's TTL
-// grammar. Inputs are lower-cased before matching so "3D" and "3d" are
-// accepted equivalently from the CLI even though the platform expects
-// the lower-case form on the wire.
-//
-// TODO: replace with a shared SDK helper once the Go and Python SDKs
-// expose a single TTL parser; see mozilla-ai/cq issue tracking the lift.
-var ttlPattern = regexp.MustCompile(`^[0-9]+[smhd]$`)
 
 // authKeyCreateLongDoc is the help text shown for cq auth key create.
 var authKeyCreateLongDoc = `Create a new API key.
@@ -95,9 +80,9 @@ func newAuthKeyCmd(cfg authOptions) *cobra.Command {
 // newAuthKeyCreateCmd returns the cq auth key create subcommand.
 func newAuthKeyCreateCmd(cfg authOptions) *cobra.Command {
 	var (
-		name   string
-		ttl    string
-		labels []string
+		name     string
+		ttlInput string
+		labels   []string
 	)
 
 	cmd := &cobra.Command{
@@ -111,7 +96,7 @@ func newAuthKeyCreateCmd(cfg authOptions) *cobra.Command {
 			// adds noise, so suppress it for any error path below.
 			cmd.SilenceUsage = true
 
-			canonicalTTL, err := parseTTL(ttl)
+			canonicalTTL, err := parseTTL(ttlInput)
 			if err != nil {
 				return err
 			}
@@ -137,7 +122,7 @@ func newAuthKeyCreateCmd(cfg authOptions) *cobra.Command {
 	}
 
 	cmd.Flags().StringVar(&name, "name", "", "Display name for the key (required).")
-	cmd.Flags().StringVar(&ttl, "ttl", "", "Lifetime in the format <integer><s|m|h|d>, e.g. 30d, 12h. Max 365d. Required.")
+	cmd.Flags().StringVar(&ttlInput, "ttl", "", "Lifetime in the format <integer><s|m|h|d>, e.g. 30d, 12h. Max 365d. Required.")
 	cmd.Flags().StringSliceVar(&labels, "labels", nil, "Optional labels (repeat --labels or supply a comma-separated list).")
 
 	_ = cmd.MarkFlagRequired("name")
@@ -268,54 +253,35 @@ func formatLabels(labels []string) string {
 	return strings.Join(labels, ",")
 }
 
-// parseTTL validates that s matches the platform's TTL grammar and
-// returns it in canonical (lower-case) form. The grammar is
-// <integer><unit>, where unit is one of s, m, h, d. The CLI accepts
-// either case (3D and 3d are equivalent on input) and always sends
-// the lower-case form on the wire because the platform validator is
-// case-sensitive today. Values whose total duration exceeds
-// maxAPIKeyTTL are rejected so the help text and the validator agree.
-//
-// TODO: replace with the shared SDK TTL parser once it lands; the
-// validator should be a single source of truth across CLI and any
-// other Go consumers. Tracked in mozilla-ai/cq.
+// ttlEchoMax bounds how many bytes of the user-supplied --ttl value
+// appear in any error message, so an attacker-controlled megabyte
+// input cannot produce a megabyte error string in cobra output or
+// logs. Matches the truncation budget in sdk/go/ttl.Parse.
+const ttlEchoMax = 64
+
+// parseTTL is a thin CLI-facing wrapper around ttl.Parse that maps the
+// SDK's typed errors into --ttl-prefixed cobra messages. The SDK owns
+// the canonical grammar, max bound, and case normalisation; this layer
+// only reshapes errors so the user sees the flag name they typed.
 func parseTTL(s string) (string, error) {
-	canonical := strings.ToLower(strings.TrimSpace(s))
-
-	if canonical == "" {
+	canonical, _, err := ttl.Parse(s)
+	// Truncate before quoting so the wrapper does not undo ttl.Parse's
+	// own bounded-output guarantee for very long inputs.
+	echo := s
+	if len(echo) > ttlEchoMax {
+		echo = echo[:ttlEchoMax]
+	}
+	switch {
+	case errors.Is(err, ttl.ErrEmpty):
 		return "", errors.New("--ttl is required: supply a value like 30d, 12h, 90d (max 365d)")
-	}
-
-	if !ttlPattern.MatchString(canonical) {
-		return "", fmt.Errorf("--ttl %q is not a valid duration: expected <integer><s|m|h|d>, e.g. 30d, 12h", s)
-	}
-
-	// The grammar guarantees a non-empty digit run followed by exactly
-	// one unit byte, so the slice operations below are safe and the
-	// numeric parse only fails when the user supplies more digits than
-	// fit in an int64 (which trivially exceeds the cap anyway).
-	digits := canonical[:len(canonical)-1]
-	unit := canonical[len(canonical)-1]
-
-	value, err := strconv.ParseInt(digits, 10, 64)
-	if err != nil {
-		return "", fmt.Errorf("--ttl %q exceeds the maximum of 365d", s)
-	}
-
-	var unitDuration time.Duration
-	switch unit {
-	case 's':
-		unitDuration = time.Second
-	case 'm':
-		unitDuration = time.Minute
-	case 'h':
-		unitDuration = time.Hour
-	case 'd':
-		unitDuration = 24 * time.Hour
-	}
-
-	if value > int64(maxAPIKeyTTL/unitDuration) {
-		return "", fmt.Errorf("--ttl %q exceeds the maximum of 365d", s)
+	case errors.Is(err, ttl.ErrGrammar):
+		return "", fmt.Errorf("--ttl %q is not a valid duration: expected <integer><s|m|h|d>, e.g. 30d, 12h", echo)
+	case errors.Is(err, ttl.ErrTooLarge):
+		return "", fmt.Errorf("--ttl %q exceeds the maximum of 365d", echo)
+	case errors.Is(err, ttl.ErrTooSmall):
+		return "", fmt.Errorf("--ttl %q must be greater than zero", echo)
+	case err != nil:
+		return "", fmt.Errorf("--ttl %q: %w", echo, err)
 	}
 
 	return canonical, nil
