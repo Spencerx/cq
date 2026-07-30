@@ -1,18 +1,72 @@
-"""Pydantic models for cq knowledge units."""
+"""Pydantic models for cq knowledge units.
+
+Every model validates on construction (and on ``model_validate``); invalid
+input raises ``pydantic.ValidationError`` — for example a free-text field over
+its maximum length, an array over its item cap, or a malformed id or extension
+key. Each failure in ``error.errors()`` carries the field location, a message,
+and the offending input.
+"""
 
 import re
 import uuid
 from datetime import UTC, datetime
 from enum import StrEnum
-from typing import Any
+from typing import Annotated, Any
 
-from pydantic import BaseModel, Field, field_validator, model_validator
+from cq_schema import (
+    ACTION_MAX_LENGTH,
+    CREATED_BY_MAX_LENGTH,
+    DETAIL_MAX_LENGTH,
+    DOMAIN_MAX_LENGTH,
+    DOMAINS_MAX_ITEMS,
+    FLAG_DETAIL_MAX_LENGTH,
+    FRAMEWORK_MAX_LENGTH,
+    FRAMEWORKS_MAX_ITEMS,
+    LANGUAGE_MAX_LENGTH,
+    LANGUAGES_MAX_ITEMS,
+    PATTERN_MAX_LENGTH,
+    SUMMARY_MAX_LENGTH,
+)
+from pydantic import AfterValidator, BaseModel, Field, ValidationInfo, field_validator, model_validator
 
 from ._util import _as_list
 
 _KU_ID_PREFIX = "ku_"
 _KU_ID_PATTERN = re.compile(r"^ku_[0-9a-f]{32}$")
 _EXTENSION_KEY_PATTERN = re.compile(r"^[a-z0-9][a-z0-9_-]*:\S+$")
+
+
+def _max_length(limit: int) -> AfterValidator:
+    """Return a validator rejecting strings longer than limit, naming the field, limit, and actual length."""
+
+    def _validate(value: str, info: ValidationInfo) -> str:
+        if len(value) > limit:
+            name = info.field_name or "value"
+            raise ValueError(f"{name} must be at most {limit} characters, got {len(value)}")
+        return value
+
+    return AfterValidator(_validate)
+
+
+def _bounded(limit: int) -> tuple[AfterValidator, object]:
+    """Return the metadata pairing an actionable length check with a declared ``maxLength``.
+
+    The ``AfterValidator`` enforces the ceiling with a message naming the field, limit, and length; the
+    ``json_schema_extra`` records the same ceiling in the generated JSON schema without enforcing it (which
+    would short-circuit the message), so the limit stays discoverable and checkable against the canonical schema.
+    """
+    return _max_length(limit), Field(json_schema_extra={"maxLength": limit})
+
+
+_Summary = Annotated[str, *_bounded(SUMMARY_MAX_LENGTH)]
+_Detail = Annotated[str, *_bounded(DETAIL_MAX_LENGTH)]
+_Action = Annotated[str, *_bounded(ACTION_MAX_LENGTH)]
+_Domain = Annotated[str, *_bounded(DOMAIN_MAX_LENGTH)]
+_Language = Annotated[str, *_bounded(LANGUAGE_MAX_LENGTH)]
+_Framework = Annotated[str, *_bounded(FRAMEWORK_MAX_LENGTH)]
+_Pattern = Annotated[str, *_bounded(PATTERN_MAX_LENGTH)]
+_CreatedBy = Annotated[str, *_bounded(CREATED_BY_MAX_LENGTH)]
+_FlagDetail = Annotated[str, *_bounded(FLAG_DETAIL_MAX_LENGTH)]
 
 
 class Tier(StrEnum):
@@ -39,7 +93,7 @@ class Flag(BaseModel):
 
     reason: FlagReason
     timestamp: datetime = Field(default_factory=lambda: datetime.now(UTC))
-    detail: str | None = None
+    detail: _FlagDetail | None = None
     duplicate_of: str | None = None
 
     @model_validator(mode="after")
@@ -53,17 +107,17 @@ class Flag(BaseModel):
 class Insight(BaseModel):
     """Tripartite insight: summary, detail, and recommended action."""
 
-    summary: str
-    detail: str
-    action: str
+    summary: _Summary
+    detail: _Detail
+    action: _Action
 
 
 class Context(BaseModel):
     """Language, framework, and pattern context for a knowledge unit."""
 
-    languages: list[str] = Field(default_factory=list)
-    frameworks: list[str] = Field(default_factory=list)
-    pattern: str = ""
+    languages: list[_Language] = Field(default_factory=list, max_length=LANGUAGES_MAX_ITEMS)
+    frameworks: list[_Framework] = Field(default_factory=list, max_length=FRAMEWORKS_MAX_ITEMS)
+    pattern: _Pattern = ""
 
 
 class Evidence(BaseModel):
@@ -97,12 +151,12 @@ class KnowledgeUnit(BaseModel):
 
     id: str
     version: int = 1
-    domains: list[str] = Field(min_length=1)
+    domains: list[_Domain] = Field(min_length=1, max_length=DOMAINS_MAX_ITEMS)
     insight: Insight
     context: Context = Field(default_factory=Context)
     evidence: Evidence = Field(default_factory=Evidence)
     tier: Tier = Tier.LOCAL
-    created_by: str = ""
+    created_by: _CreatedBy = ""
     superseded_by: str | None = None
     extensions: dict[str, Any] | None = None
     flags: list[Flag] = Field(default_factory=list)
@@ -149,7 +203,24 @@ def create_knowledge_unit(
     tier: Tier = Tier.LOCAL,
     created_by: str = "",
 ) -> KnowledgeUnit:
-    """Create a new knowledge unit with an auto-generated ID."""
+    """Create a new knowledge unit with an auto-generated ID.
+
+    Args:
+        domains: Domain tags for the unit; at least one is required.
+        insight: The tripartite insight (summary, detail, action).
+        context: Optional language, framework, and pattern context.
+        extensions: Optional implementation-specific namespaced fields.
+        tier: Storage tier; defaults to local.
+        created_by: Identifier of the creating agent or user.
+
+    Returns:
+        The validated knowledge unit.
+
+    Raises:
+        pydantic.ValidationError: If a field violates the schema, such as a
+            free-text field exceeding its maximum length, an array exceeding
+            its item cap, or a malformed extension key.
+    """
     domains = _as_list(domains)
     return KnowledgeUnit(
         id=_generate_ku_id(),
